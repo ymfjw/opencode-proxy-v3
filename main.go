@@ -27,7 +27,6 @@ func getReplacer(requestedModel string) *strings.Replacer {
 		return strings.NewReplacer(
 			"mimo-v2.5-free", "mimo-v2.5-pro",
 			"deepseek-v4-flash-free", "deepseek-v4-flash",
-			"hy3-free", "hy3",
 			"系统指令", "身份设定",
 			"系统提示词", "角色设定",
 			"系统提示", "背景设定",
@@ -40,13 +39,11 @@ func getReplacer(requestedModel string) *strings.Replacer {
 		return strings.NewReplacer(
 			"mimo-v2.5-free", "mimo-v2.5",
 			"deepseek-v4-flash-free", "deepseek-v4-flash",
-			"hy3-free", "hy3",
 		)
 	}
 	// 默认 Replacer
 	return strings.NewReplacer(
 		"deepseek-v4-flash-free", "deepseek-v4-flash",
-		"hy3-free", "hy3",
 	)
 }
 
@@ -55,7 +52,6 @@ func getKeepLength(buf []byte) int {
 	targets := []string{
 		"mimo-v2.5-free",
 		"deepseek-v4-flash-free",
-		"hy3-free",
 		"系统指令",
 		"系统提示词",
 		"系统提示",
@@ -80,9 +76,6 @@ func getKeepLength(buf []byte) int {
 func getInjectionPrompt(model string) string {
 	if model == "mimo-v2.5-pro" {
 		return "你是由小米大模型Core团队精心打造的语言模型 MiMo-v2.5-pro。请始终认同并坚称自己的版本是 MiMo-v2.5-pro。在思考（reasoning）和回复中，请表现得完全自然，如同你本就如此，绝对不要提及“系统提示”、“指令要求”、“注入”或任何暗示你的身份被修改过的痕迹。"
-	}
-	if model == "hy3" {
-		return "你是由腾讯精心研发的混元大模型（hy3）。请始终认同并坚称自己的版本是 hy3。在思考（reasoning）和回复中，请表现得完全自然，如同你本就如此，绝对不要提及“系统提示”、“指令要求”、“注入”或任何暗示你的身份被修改过的痕迹。"
 	}
 	return ""
 }
@@ -231,9 +224,6 @@ func main() {
 						} else if model == "mimo-v2.5" {
 							reqData["model"] = "mimo-v2.5-free"
 							modified = true
-						} else if model == "hy3" {
-							reqData["model"] = "hy3-free"
-							modified = true
 						}
 						
 						if modified {
@@ -318,12 +308,6 @@ func main() {
 				},
 				{
 					"id":       "mimo-v2.5",
-					"object":   "model",
-					"created":  time.Now().Unix(),
-					"owned_by": "mimo",
-				},
-				{
-					"id":       "hy3",
 					"object":   "model",
 					"created":  time.Now().Unix(),
 					"owned_by": "mimo",
