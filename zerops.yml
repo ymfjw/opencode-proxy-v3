@@ -1,0 +1,13 @@
+zerops:
+  # 注意：这里的 setup 名称必须和您在 Zerops 控制台左侧创建的服务名称完全一致！
+  # 截图显示您的服务名字就叫 docker，所以这里填 docker
+  - setup: docker
+    run:
+      base: docker@1
+      prepareCommands:
+        # 直接拉取我们刚刚在 DockerHub 上打包好的完美 V4 纯净镜像，无需在云端重复编译
+        - docker pull forever359/opencodefree:v4
+      ports:
+        - port: 8080
+          httpSupport: true
+      start: docker run --network=host forever359/opencodefree:v4
