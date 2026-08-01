@@ -16,11 +16,122 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 //go:embed public/*
 var publicFiles embed.FS
+
+// ----------------------------------------------------
+// 双活 Worker 与 429 故障自愈重试逻辑
+// ----------------------------------------------------
+
+type Worker struct {
+	URL      *url.URL
+	IsDown   bool
+	LastFail time.Time
+	mu       sync.Mutex
+}
+
+func (w *Worker) markDirtyAndRestart() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// 如果已经在 30 秒内触发过重启，则忽略，防止密集重启
+	if w.IsDown && time.Since(w.LastFail) < 30*time.Second {
+		return
+	}
+	w.IsDown = true
+	w.LastFail = time.Now()
+
+	go func() {
+		log.Printf("[后台自愈] Worker %s 遇到 429 限制，触发重启刷新 Device Token...", w.URL.String())
+		// 调用外部重启脚本（需在容器或系统中提前放置 restart_worker.sh）
+		// 将端口号作为参数传给脚本
+		port := w.URL.Port()
+		if port == "" {
+			port = "80"
+		}
+		cmd := exec.Command("bash", "/app/restart_worker.sh", port)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Printf("[后台自愈] Worker %s 重启脚本执行异常: %v", w.URL.String(), err)
+		}
+		
+		// 预留足够的时间等待 Worker 完全启动
+		time.Sleep(15 * time.Second)
+		
+		w.mu.Lock()
+		w.IsDown = false
+		w.mu.Unlock()
+		log.Printf("[后台自愈] Worker %s 刷新完成，重新加入可用队列", w.URL.String())
+	}()
+}
+
+type RetryTransport struct {
+	Transport http.RoundTripper
+	Workers   []*Worker
+	Next      uint32
+}
+
+func (t *RetryTransport) getNextWorker() *Worker {
+	for i := 0; i < len(t.Workers); i++ {
+		idx := atomic.AddUint32(&t.Next, 1) % uint32(len(t.Workers))
+		w := t.Workers[idx]
+		w.mu.Lock()
+		isDown := w.IsDown
+		w.mu.Unlock()
+		if !isDown {
+			return w
+		}
+	}
+	// 如果全部 Worker 都在自愈中，强行分配一个
+	return t.Workers[0]
+}
+
+func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+
+	maxRetries := len(t.Workers)
+	for i := 0; i < maxRetries; i++ {
+		w := t.getNextWorker()
+
+		// 克隆 Request，避免修改原有 Request 影响其他逻辑
+		clonedReq := req.Clone(req.Context())
+		clonedReq.URL.Scheme = w.URL.Scheme
+		clonedReq.URL.Host = w.URL.Host
+		// 注意：如果不修改 clonedReq.Host，会保留原本发来的 Host 或者 Opencode.ai
+		// 这里根据外部代理的要求决定。我们保持原逻辑中的 Host 修改（在 Director 里做）
+
+		if bodyBytes != nil {
+			clonedReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		resp, err := t.Transport.RoundTrip(clonedReq)
+		if err != nil {
+			log.Printf("请求 Worker %s 发生网络错误: %v", w.URL.String(), err)
+			w.markDirtyAndRestart()
+			continue
+		}
+
+		if resp.StatusCode == 429 {
+			log.Printf("Worker %s 返回 429 FreeUsageLimitError，触发切换机制", w.URL.String())
+			w.markDirtyAndRestart()
+			resp.Body.Close()
+			continue
+		}
+
+		return resp, nil
+	}
+	return nil, fmt.Errorf("all workers failed or returned 429")
+}
+
+// ----------------------------------------------------
 
 // 动态生成 Replacer，根据请求的模型区分要替换的名称
 func getReplacer(requestedModel string) *strings.Replacer {
@@ -203,8 +314,37 @@ func main() {
 	}
 	fsHandler := http.FileServer(http.FS(subFS))
 
-	opencodeURL, _ := url.Parse("https://opencode.ai")
-	proxy := httputil.NewSingleHostReverseProxy(opencodeURL)
+	// 初始化 Workers 列表
+	workerStrs := os.Getenv("WORKERS")
+	var workers []*Worker
+	if workerStrs == "" {
+		// 默认行为（向后兼容）：直连 opencode.ai
+		opencodeURL, _ := url.Parse("https://opencode.ai")
+		workers = append(workers, &Worker{URL: opencodeURL})
+		log.Printf("未检测到 WORKERS 环境变量，采用单点直连模式: %s", opencodeURL.String())
+	} else {
+		// 比如：WORKERS="http://127.0.0.1:8001,http://127.0.0.1:8002"
+		urls := strings.Split(workerStrs, ",")
+		for _, uStr := range urls {
+			uStr = strings.TrimSpace(uStr)
+			if uStr != "" {
+				u, err := url.Parse(uStr)
+				if err == nil {
+					workers = append(workers, &Worker{URL: u})
+				}
+			}
+		}
+		log.Printf("启用了双活/多活 Worker 模式，共有 %d 个节点待命", len(workers))
+	}
+
+	// 我们依然用 SingleHostReverseProxy，但底层替换为自定义的 RetryTransport 来实现动态切换目标
+	proxy := httputil.NewSingleHostReverseProxy(workers[0].URL) // 这里的 URL 仅作初始化，实际会由 RetryTransport 覆写
+	
+	proxy.Transport = &RetryTransport{
+		Transport: http.DefaultTransport,
+		Workers:   workers,
+	}
+	
 	originalDirector := proxy.Director
 
 	proxy.Director = func(req *http.Request) {
@@ -292,7 +432,8 @@ func main() {
 		if strings.HasPrefix(req.URL.Path, "/v1/") {
 			req.URL.Path = "/zen" + req.URL.Path
 		}
-		req.Host = opencodeURL.Host
+		// Host 设置：为了让外部 opencodefree 能够正确识别或向后兼容直连
+		req.Host = "opencode.ai"
 		req.Header.Set("Authorization", "Bearer public")
 		req.Header.Set("x-opencode-client", "desktop")
 		

@@ -30,7 +30,8 @@ COPY --from=builder /app/proxy /app/proxy
 # 复制 Nginx 配置文件和启动脚本
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY restart_worker.sh /app/restart_worker.sh
+RUN chmod +x /app/entrypoint.sh /app/restart_worker.sh
 
 EXPOSE 8080
 
