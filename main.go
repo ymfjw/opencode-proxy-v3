@@ -122,11 +122,13 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		clonedReq.URL.Scheme = w.URL.Scheme
 		clonedReq.URL.Host = w.URL.Host
 
-		// 动态路径和鉴权修正：如果直连官方源站，需补充 /zen 和 public 密钥；如果请求本地 opencodefree 节点，则原样透传
+		// 动态路径修正：官方的真实路径包含 /zen，无论直连还是发给本地代理节点，都必须加上 /zen 否则上游报 404
+		if strings.HasPrefix(clonedReq.URL.Path, "/v1/") {
+			clonedReq.URL.Path = "/zen" + clonedReq.URL.Path
+		}
+
+		// 鉴权修正：如果直连官方源站，需补充 public 密钥；如果请求本地 opencodefree 节点，则原样透传
 		if strings.Contains(w.URL.Host, "opencode.ai") {
-			if strings.HasPrefix(clonedReq.URL.Path, "/v1/") {
-				clonedReq.URL.Path = "/zen" + clonedReq.URL.Path
-			}
 			clonedReq.Header.Set("Authorization", "Bearer public")
 		}
 
