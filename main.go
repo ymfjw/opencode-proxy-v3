@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -44,10 +46,21 @@ func (w *Worker) markDirtyAndRestart() {
 	w.IsDown = true
 	w.LastFail = time.Now()
 
+	// 如果是直连远程域名（如 opencode.ai），不要触发本地重启脚本
+	if w.URL.Hostname() == "opencode.ai" || w.URL.Scheme == "https" {
+		go func() {
+			log.Printf("[直连模式] 远程 Worker %s 响应异常/429，标记临时冷却 5 秒...", w.URL.String())
+			time.Sleep(5 * time.Second)
+			w.mu.Lock()
+			w.IsDown = false
+			w.mu.Unlock()
+		}()
+		return
+	}
+
 	go func() {
 		log.Printf("[后台自愈] Worker %s 遇到 429 限制，触发重启刷新 Device Token...", w.URL.String())
 		// 调用外部重启脚本（需在容器或系统中提前放置 restart_worker.sh）
-		// 将端口号作为参数传给脚本
 		port := w.URL.Port()
 		if port == "" {
 			port = "80"
@@ -98,6 +111,9 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	maxRetries := len(t.Workers)
+	var lastErr error
+	var lastResp *http.Response
+
 	for i := 0; i < maxRetries; i++ {
 		w := t.getNextWorker()
 
@@ -105,8 +121,6 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		clonedReq := req.Clone(req.Context())
 		clonedReq.URL.Scheme = w.URL.Scheme
 		clonedReq.URL.Host = w.URL.Host
-		// 注意：如果不修改 clonedReq.Host，会保留原本发来的 Host 或者 Opencode.ai
-		// 这里根据外部代理的要求决定。我们保持原逻辑中的 Host 修改（在 Director 里做）
 
 		if bodyBytes != nil {
 			clonedReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -114,19 +128,36 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err := t.Transport.RoundTrip(clonedReq)
 		if err != nil {
+			// 如果是客户端主动取消请求（如用户停止生成），直接透传错误，切勿误判为 Worker 损坏！
+			if errors.Is(err, context.Canceled) || errors.Is(req.Context().Err(), context.Canceled) {
+				return nil, err
+			}
 			log.Printf("请求 Worker %s 发生网络错误: %v", w.URL.String(), err)
+			lastErr = err
 			w.markDirtyAndRestart()
 			continue
 		}
 
 		if resp.StatusCode == 429 {
 			log.Printf("Worker %s 返回 429 FreeUsageLimitError，触发切换机制", w.URL.String())
+			lastResp = resp
 			w.markDirtyAndRestart()
-			resp.Body.Close()
-			continue
+			if i < maxRetries-1 {
+				resp.Body.Close()
+				continue
+			}
+			// 如果已经是最后一个 Worker（或单 Worker 模式），把真实的 429 响应透传给客户端
+			return resp, nil
 		}
 
 		return resp, nil
+	}
+
+	if lastResp != nil {
+		return lastResp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return nil, fmt.Errorf("all workers failed or returned 429")
 }
