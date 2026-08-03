@@ -12,7 +12,8 @@ FROM node:alpine
 RUN apk add --no-cache nginx git curl bash
 
 # 安装 RTK (Rust Token Killer) 到 /usr/local/bin
-RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh && \
+    ln -s /root/.local/bin/rtk /usr/local/bin/rtk
 
 # 克隆 NodeJS-Argo (这里使用较为通用的 eooce 版本或直接使用 yutian81 仓库)
 WORKDIR /app
