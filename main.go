@@ -359,9 +359,9 @@ func main() {
 	workerStrs := os.Getenv("WORKERS")
 	var workers []*Worker
 	if workerStrs == "" {
-		// 默认行为：启用内置的 All-In-One 终极双活模式
-		workerStrs = "http://127.0.0.1:8001,http://127.0.0.1:8002"
-		log.Printf("未检测到 WORKERS 环境变量，启用内置的 All-In-One 双活模式 (8001/8002)！")
+		// 默认行为：直连官方 OpenCode.ai 高可用源站
+		workerStrs = "https://opencode.ai"
+		log.Printf("未检测到 WORKERS 环境变量，采用单点直连模式: https://opencode.ai")
 	}
 
 	// 比如：WORKERS="http://127.0.0.1:8001,http://127.0.0.1:8002"
