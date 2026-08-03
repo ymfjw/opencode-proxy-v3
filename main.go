@@ -122,6 +122,11 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		clonedReq.URL.Scheme = w.URL.Scheme
 		clonedReq.URL.Host = w.URL.Host
 
+		// 动态路径修正：如果直连官方源站，需补充 /zen；如果请求本地 opencodefree 节点，则保持 /v1/ 原样
+		if strings.Contains(w.URL.Host, "opencode.ai") && strings.HasPrefix(clonedReq.URL.Path, "/v1/") {
+			clonedReq.URL.Path = "/zen" + clonedReq.URL.Path
+		}
+
 		if bodyBytes != nil {
 			clonedReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
@@ -458,10 +463,6 @@ func main() {
 			}
 		}
 
-		// OpenCode 路线配置
-		if strings.HasPrefix(req.URL.Path, "/v1/") {
-			req.URL.Path = "/zen" + req.URL.Path
-		}
 		// Host 设置：为了让外部 opencodefree 能够正确识别或向后兼容直连
 		req.Host = "opencode.ai"
 		req.Header.Set("Authorization", "Bearer public")
