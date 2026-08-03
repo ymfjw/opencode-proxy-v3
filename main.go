@@ -349,24 +349,23 @@ func main() {
 	workerStrs := os.Getenv("WORKERS")
 	var workers []*Worker
 	if workerStrs == "" {
-		// 默认行为（向后兼容）：直连 opencode.ai
-		opencodeURL, _ := url.Parse("https://opencode.ai")
-		workers = append(workers, &Worker{URL: opencodeURL})
-		log.Printf("未检测到 WORKERS 环境变量，采用单点直连模式: %s", opencodeURL.String())
-	} else {
-		// 比如：WORKERS="http://127.0.0.1:8001,http://127.0.0.1:8002"
-		urls := strings.Split(workerStrs, ",")
-		for _, uStr := range urls {
-			uStr = strings.TrimSpace(uStr)
-			if uStr != "" {
-				u, err := url.Parse(uStr)
-				if err == nil {
-					workers = append(workers, &Worker{URL: u})
-				}
+		// 默认行为：启用内置的 All-In-One 终极双活模式
+		workerStrs = "http://127.0.0.1:8001,http://127.0.0.1:8002"
+		log.Printf("未检测到 WORKERS 环境变量，启用内置的 All-In-One 双活模式 (8001/8002)！")
+	}
+
+	// 比如：WORKERS="http://127.0.0.1:8001,http://127.0.0.1:8002"
+	urls := strings.Split(workerStrs, ",")
+	for _, uStr := range urls {
+		uStr = strings.TrimSpace(uStr)
+		if uStr != "" {
+			u, err := url.Parse(uStr)
+			if err == nil {
+				workers = append(workers, &Worker{URL: u})
 			}
 		}
-		log.Printf("启用了双活/多活 Worker 模式，共有 %d 个节点待命", len(workers))
 	}
+	log.Printf("启用了双活/多活 Worker 模式，共有 %d 个节点待命", len(workers))
 
 	// 我们依然用 SingleHostReverseProxy，但底层替换为自定义的 RetryTransport 来实现动态切换目标
 	proxy := httputil.NewSingleHostReverseProxy(workers[0].URL) // 这里的 URL 仅作初始化，实际会由 RetryTransport 覆写

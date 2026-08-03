@@ -27,11 +27,14 @@ RUN npm install
 WORKDIR /app
 COPY --from=builder /app/proxy /app/proxy
 
-# 复制 Nginx 配置文件和启动脚本
+# 复制 Nginx 配置文件、启动脚本和自愈脚本
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY entrypoint.sh /app/entrypoint.sh
 COPY restart_worker.sh /app/restart_worker.sh
-RUN chmod +x /app/entrypoint.sh /app/restart_worker.sh
+
+# 复制真正的 OpenCodeFree 节点程序
+COPY opencodefree /usr/local/bin/opencodefree
+RUN chmod +x /app/entrypoint.sh /app/restart_worker.sh /usr/local/bin/opencodefree
 
 EXPOSE 8080
 

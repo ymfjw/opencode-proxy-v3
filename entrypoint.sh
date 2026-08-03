@@ -6,6 +6,13 @@ LISTEN_PORT=${PORT:-8080}
 # 确保所有后台进程退出时容器能正确处理
 trap "exit" SIGINT SIGTERM
 
+echo "Starting local OpenCode Worker 1 on port 8001..."
+# 此处不强行指定 HTTP_PROXY，如果在无法直连的国内机器部署则需修改此脚本，这里默认容器拥有干净网络出站
+nohup /usr/local/bin/opencodefree --port 8001 >/dev/null 2>&1 &
+
+echo "Starting local OpenCode Worker 2 on port 8002..."
+nohup /usr/local/bin/opencodefree --port 8002 >/dev/null 2>&1 &
+
 echo "Starting OpenCode API Gateway on internal port 3000..."
 PORT=3000 /app/proxy &
 

@@ -11,8 +11,6 @@ pkill -f "opencodefree.*$PORT" 2>/dev/null || true
 sleep 1
 
 # 重新启动并放入后台
-# 这里设置代理变量以防被墙导致握手失败
-HTTP_PROXY=http://127.0.0.1:8118 HTTPS_PROXY=http://127.0.0.1:8118 \
-nohup /app/opencodefree --port $PORT >/dev/null 2>&1 &
+nohup /usr/local/bin/opencodefree --port $PORT >/dev/null 2>&1 &
 
 echo "[AutoHeal] 重启指令已发送！"
