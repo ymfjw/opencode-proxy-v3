@@ -358,21 +358,7 @@ func main() {
 								modified = true
 							}
 						}
-						
-						// RTK 压缩检测：遍历所有 message 压缩超长文本
-						if msgs, ok := reqData["messages"].([]interface{}); ok {
-							for i, msg := range msgs {
-								if msgMap, ok := msg.(map[string]interface{}); ok {
-									if contentStr, ok := msgMap["content"].(string); ok {
-										if len(contentStr) > 3000 {
-											msgMap["content"] = compressWithRTK(contentStr)
-											msgs[i] = msgMap
-											modified = true
-										}
-									}
-								}
-							}
-						}
+
 
 						modelLower := strings.ToLower(model)
 						if strings.HasPrefix(modelLower, "deepseek") {
