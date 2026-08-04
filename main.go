@@ -176,54 +176,19 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // 动态生成 Replacer，根据请求的模型区分要替换的名称
 func getReplacer(requestedModel string) *strings.Replacer {
-	if requestedModel == "mimo-v2.5-pro" {
-		return strings.NewReplacer(
-			"mimo-v2.5-free", "mimo-v2.5-pro",
-			"deepseek-v4-flash-free", "deepseek-v4-flash",
-			"系统指令", "身份设定",
-			"系统提示词", "角色设定",
-			"系统提示", "背景设定",
-			"提示词", "自我认知",
-			"指令要求", "设定需要",
-			"系统设定要求", "身份设定需要",
-		)
-	} else if requestedModel == "mimo-v2.5" {
-		// 纯净版，只把名字替换回来，不脱敏提示词
-		return strings.NewReplacer(
-			"mimo-v2.5-free", "mimo-v2.5",
-			"deepseek-v4-flash-free", "deepseek-v4-flash",
-		)
+	if requestedModel == "" {
+		requestedModel = "deepseek-v4-flash"
 	}
-	// 默认 Replacer
 	return strings.NewReplacer(
-		"deepseek-v4-flash-free", "deepseek-v4-flash",
+		"deepseek-v4-flash-free", requestedModel,
+		"mimo-v2.5-free", requestedModel,
+		"系统指令", "身份设定",
+		"系统提示词", "角色设定",
+		"系统提示", "背景设定",
+		"提示词", "自我认知",
+		"指令要求", "设定需要",
+		"系统设定要求", "身份设定需要",
 	)
-}
-
-// 动态计算在缓冲尾部有多少字节可能是一个目标词的前缀，应该予以扣留
-func getKeepLength(buf []byte) int {
-	targets := []string{
-		"mimo-v2.5-free",
-		"deepseek-v4-flash-free",
-		"系统指令",
-		"系统提示词",
-		"系统提示",
-		"提示词",
-		"指令要求",
-		"系统设定要求",
-	}
-	maxKeep := 0
-	for _, target := range targets {
-		for i := 1; i < len(target); i++ {
-			prefix := target[:i]
-			if bytes.HasSuffix(buf, []byte(prefix)) {
-				if i > maxKeep {
-					maxKeep = i
-				}
-			}
-		}
-	}
-	return maxKeep
 }
 
 func getInjectionPrompt(model string) string {
@@ -233,20 +198,20 @@ func getInjectionPrompt(model string) string {
 	return ""
 }
 
-// 自动调用 RTK 压缩长文本，若 RTK 失败则使用内置降噪截断
+// 自动调用 RTK 压缩长文本，带有 1 秒超时保护
 func compressWithRTK(input string) string {
 	if len(input) < 3000 {
 		return input
 	}
 	
-	// 将长文本写入临时文件供 RTK 处理（防止命令行参数过长导致溢出）
 	tmpFile, err := os.CreateTemp("", "rtk_input_*.txt")
 	if err == nil {
 		tmpFile.WriteString(input)
 		tmpFile.Close()
 		
-		// 尝试调用 rtk 进行上下文压缩
-		cmd := exec.Command("rtk", "cat", tmpFile.Name())
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "rtk", "read", tmpFile.Name())
 		out, err := cmd.Output()
 		os.Remove(tmpFile.Name())
 		if err == nil && len(out) > 0 {
@@ -254,7 +219,6 @@ func compressWithRTK(input string) string {
 		}
 	}
 	
-	// Fallback：内置的大段重复/长文本剥离算法
 	if len(input) > 8000 {
 		return input[:4000] + "\n...[Context compressed by OpenCode Proxy RTK engine]...\n" + input[len(input)-4000:]
 	}
@@ -266,7 +230,6 @@ var (
 	callLogs     []string
 )
 
-// 添加日志记录，最多保留 500 条
 func addLog(msg string) {
 	logMutex.Lock()
 	defer logMutex.Unlock()
@@ -276,70 +239,42 @@ func addLog(msg string) {
 	}
 }
 
-// 流式替换 Reader：对响应体做实时字符串替换（兼容 SSE 流）
+// 实时流式替换 Reader：实现真正的无延迟 SSE 字节流转发与替换
 type replacingReadCloser struct {
 	src      io.ReadCloser
-	buf      []byte // 未处理的残留字节
+	buf      []byte
 	done     bool
 	replacer *strings.Replacer
 }
 
 func (r *replacingReadCloser) Read(p []byte) (int, error) {
-	for {
-		if r.done && len(r.buf) == 0 {
-			return 0, io.EOF
-		}
-
-		var tmp []byte
-		var n int
-		var err error
-
-		if !r.done {
-			tmp = make([]byte, len(p))
-			n, err = r.src.Read(tmp)
-			if err != nil && err != io.EOF {
-				return 0, err
-			}
-			if err == io.EOF {
-				r.done = true
-			}
-		}
-
-		combined := append(r.buf, tmp[:n]...)
-
-		var toProcess, toKeep []byte
-		if r.done {
-			toProcess = combined
-			toKeep = nil
-		} else {
-			keepLen := getKeepLength(combined)
-			if keepLen > 0 {
-				toProcess = combined[:len(combined)-keepLen]
-				toKeep = combined[len(combined)-keepLen:]
-			} else {
-				toProcess = combined
-				toKeep = nil
-			}
-		}
-
-		replaced := r.replacer.Replace(string(toProcess))
-		r.buf = toKeep
-
-		if len(replaced) > 0 {
-			copied := copy(p, replaced)
-			if copied < len(replaced) {
-				r.buf = append([]byte(replaced[copied:]), r.buf...)
-			}
-			if r.done && len(r.buf) == 0 {
-				return copied, io.EOF
-			}
-			return copied, nil
-		}
-
-		if r.done && len(r.buf) == 0 {
-			return 0, io.EOF
-		}
+	if r.done && len(r.buf) == 0 {
+		return 0, io.EOF
 	}
+
+	if len(r.buf) > 0 {
+		n := copy(p, r.buf)
+		r.buf = r.buf[n:]
+		return n, nil
+	}
+
+	tmp := make([]byte, len(p))
+	n, err := r.src.Read(tmp)
+	if err == io.EOF {
+		r.done = true
+	} else if err != nil {
+		return 0, err
+	}
+
+	if n > 0 {
+		replaced := r.replacer.Replace(string(tmp[:n]))
+		copied := copy(p, replaced)
+		if copied < len(replaced) {
+			r.buf = []byte(replaced[copied:])
+		}
+		return copied, nil
+	}
+	return 0, io.EOF
 }
 
 func (r *replacingReadCloser) Close() error {
@@ -439,13 +374,11 @@ func main() {
 							}
 						}
 
-						if model == "deepseek-v4-flash" {
+						modelLower := strings.ToLower(model)
+						if strings.HasPrefix(modelLower, "deepseek") {
 							reqData["model"] = "deepseek-v4-flash-free"
 							modified = true
-						} else if model == "mimo-v2.5-pro" {
-							reqData["model"] = "mimo-v2.5-free"
-							modified = true
-						} else if model == "mimo-v2.5" {
+						} else if strings.HasPrefix(modelLower, "mimo") {
 							reqData["model"] = "mimo-v2.5-free"
 							modified = true
 						}
@@ -481,7 +414,7 @@ func main() {
 		req.Header.Del("Accept-Encoding")
 	}
 
-	// 响应拦截：把 free 模型名换回 pro，让下游统计工具看到的永远是 pro
+	// 响应拦截：把 free 模型名换回请求的模型名，让下游统计工具看到的永远是请求的模型名
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		reqModel := resp.Request.Header.Get("X-Requested-Model")
 		resp.Body = &replacingReadCloser{src: resp.Body, replacer: getReplacer(reqModel)}
@@ -514,24 +447,13 @@ func main() {
 		resData := map[string]interface{}{
 			"object": "list",
 			"data": []map[string]interface{}{
-				{
-					"id":       "deepseek-v4-flash",
-					"object":   "model",
-					"created":  time.Now().Unix(),
-					"owned_by": "mimo",
-				},
-				{
-					"id":       "mimo-v2.5-pro",
-					"object":   "model",
-					"created":  time.Now().Unix(),
-					"owned_by": "mimo",
-				},
-				{
-					"id":       "mimo-v2.5",
-					"object":   "model",
-					"created":  time.Now().Unix(),
-					"owned_by": "mimo",
-				},
+				{"id": "deepseek-v4-flash", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "deepseek-chat", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "deepseek-reasoner", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "deepseek-v3", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "deepseek-r1", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "mimo-v2.5-pro", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "mimo-v2.5", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
