@@ -453,9 +453,28 @@ func main() {
 	// 响应拦截：把 free 模型名换回请求的模型名，让下游统计工具看到的永远是请求的模型名
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		reqModel := resp.Request.Header.Get("X-Requested-Model")
-		resp.Body = &replacingReadCloser{src: resp.Body, replacer: getReplacer(reqModel)}
-		resp.Header.Del("Content-Length") // 替换后长度可能变化
-		resp.ContentLength = -1
+		replacer := getReplacer(reqModel)
+		
+		contentType := resp.Header.Get("Content-Type")
+		if strings.Contains(contentType, "text/event-stream") {
+			// 流式响应 (SSE)：使用流式替换器
+			resp.Body = &replacingReadCloser{src: resp.Body, replacer: replacer}
+			resp.Header.Del("Content-Length")
+			resp.ContentLength = -1
+		} else {
+			// 非流式响应 (JSON)：一次性全量读取并替换，重新设置 100% 精确的 Content-Length
+			if resp.Body != nil {
+				bodyBytes, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					replaced := replacer.Replace(string(bodyBytes))
+					newBytes := []byte(replaced)
+					resp.Body = io.NopCloser(bytes.NewReader(newBytes))
+					resp.ContentLength = int64(len(newBytes))
+					resp.Header.Set("Content-Length", fmt.Sprint(len(newBytes)))
+				}
+			}
+		}
 		return nil
 	}
 
