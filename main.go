@@ -180,6 +180,7 @@ func getReplacer(requestedModel string) *strings.Replacer {
 		requestedModel = "deepseek-v4-flash"
 	}
 	return strings.NewReplacer(
+		"hy3-free", requestedModel,
 		"deepseek-v4-flash-free", requestedModel,
 		"mimo-v2.5-free", requestedModel,
 		"系统指令", "身份设定",
@@ -361,7 +362,10 @@ func main() {
 
 
 						modelLower := strings.ToLower(model)
-						if strings.HasPrefix(modelLower, "deepseek") {
+						if modelLower == "hy3" {
+							reqData["model"] = "hy3-free"
+							modified = true
+						} else if strings.HasPrefix(modelLower, "deepseek") {
 							reqData["model"] = "deepseek-v4-flash-free"
 							modified = true
 						} else if strings.HasPrefix(modelLower, "mimo") {
@@ -433,6 +437,7 @@ func main() {
 		resData := map[string]interface{}{
 			"object": "list",
 			"data": []map[string]interface{}{
+				{"id": "hy3", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "deepseek-v4-flash", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "deepseek-chat", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "deepseek-reasoner", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
