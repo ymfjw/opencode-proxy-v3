@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,48 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// 动态生成符合规范的 UUIDv4 伪随机字符，打散单会话配额与轨迹追溯
+func generateRandomUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // Variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+// 模拟最新 Chrome Desktop / VSCode Electron 物理客户端全维度指纹 Header
+func applyClientFingerprint(req *http.Request) {
+	// 1. 重写 User-Agent，覆写默认的 Go-http-client 特征
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Opencode/1.0.8")
+	
+	// 2. 注入 Client-Hints (Chromium 物理环境指纹)
+	req.Header.Set("sec-ch-ua", `"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	
+	// 3. 注入 Fetch Metadata (跨域与来源伪装)
+	req.Header.Set("sec-fetch-dest", "empty")
+	req.Header.Set("sec-fetch-mode", "cors")
+	req.Header.Set("sec-fetch-site", "cross-site")
+	
+	// 4. 标准 HTTP 语言与 Accept 标头
+	req.Header.Set("Accept", "application/json, text/event-stream, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+	
+	// 5. OpenCode 客户端固定关联标头
+	req.Header.Set("x-opencode-client", "desktop")
+	req.Header.Set("x-opencode-version", "1.0.8")
+	req.Header.Set("Origin", "https://opencode.ai")
+	req.Header.Set("Referer", "https://opencode.ai/")
+	
+	// 6. 动态伪造独立 Session ID 与 Request ID，彻底隔离每笔请求的指纹追踪
+	sessionID := generateRandomUUID()
+	reqID := generateRandomUUID()
+	req.Header.Set("x-opencode-session-id", sessionID)
+	req.Header.Set("x-request-id", reqID)
+	req.Header.Set("x-correlation-id", reqID)
+}
 
 //go:embed public/*
 var publicFiles embed.FS
@@ -393,7 +436,10 @@ func main() {
 
 		// Host 设置：为了让外部 opencodefree 能够正确识别或向后兼容直连
 		req.Host = "opencode.ai"
-		req.Header.Set("x-opencode-client", "desktop")
+		req.Header.Set("Authorization", "Bearer public")
+		
+		// 全维度应用物理客户端指纹与动态 Session/Request UUID 伪装
+		applyClientFingerprint(req)
 		
 		if requestedModel != "unknown" {
 			addLog(fmt.Sprintf("[%s] 请求 %s -> ☁️ 分配至 OpenCode 渠道", time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"), requestedModel))
