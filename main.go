@@ -57,10 +57,16 @@ func applyClientFingerprint(req *http.Request) {
 	req.Header.Set("Origin", "https://opencode.ai")
 	req.Header.Set("Referer", "https://opencode.ai/")
 	
-	// 6. 动态伪造独立 Session ID 与 Request ID，彻底隔离每笔请求的指纹追踪
-	sessionID := generateRandomUUID()
+	// 6. 动态伪造独立 Session ID 与 Request ID，彻底隔离每笔请求的指纹追踪（适配 2026-09-06 强制校验）
+	rawUUID := strings.ReplaceAll(generateRandomUUID(), "-", "")
+	if len(rawUUID) > 24 {
+		rawUUID = rawUUID[:24]
+	}
+	sessionID := "ses_" + rawUUID
 	reqID := generateRandomUUID()
+	req.Header.Set("x-opencode-session", sessionID)
 	req.Header.Set("x-opencode-session-id", sessionID)
+	req.Header.Set("x-session-id", sessionID)
 	req.Header.Set("x-request-id", reqID)
 	req.Header.Set("x-correlation-id", reqID)
 }
