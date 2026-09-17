@@ -23,26 +23,55 @@ import (
 	"time"
 )
 
-// 动态生成符合规范的 UUIDv4 伪随机字符，打散单会话配额与轨迹追溯
-func generateRandomUUID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // Variant 10
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+var (
+	idGenMu       sync.Mutex
+	lastTimestamp int64
+	idCounter     int64
+)
+
+// 严格还原 OpenCode 官方单调 ID 生成算法 (Prefix + 6字节时间戳 + 14位Base62随机串)
+func generateOpenCodeID(prefix string) string {
+	idGenMu.Lock()
+	defer idGenMu.Unlock()
+
+	nowMs := time.Now().UnixMilli()
+	if nowMs != lastTimestamp {
+		lastTimestamp = nowMs
+		idCounter = 0
+	}
+	idCounter++
+
+	// descending 模式按位取反（与官方 TypeScript 实现 100% 一致）
+	now := ^(nowMs*0x1000 + idCounter)
+
+	var timeBytes [6]byte
+	for i := 0; i < 6; i++ {
+		timeBytes[i] = byte((now >> (40 - 8*uint(i))) & 0xff)
+	}
+
+	randBytes := make([]byte, 14)
+	_, _ = rand.Read(randBytes)
+	randomPart := make([]byte, 14)
+	for i := 0; i < 14; i++ {
+		randomPart[i] = base62Alphabet[randBytes[i]%62]
+	}
+
+	return fmt.Sprintf("%s_%x%s", prefix, timeBytes, string(randomPart))
 }
 
 // 模拟最新 Chrome Desktop / VSCode Electron 物理客户端全维度指纹 Header
 func applyClientFingerprint(req *http.Request) {
-	// 1. 重写 User-Agent，覆写默认的 Go-http-client 特征
+	// 1. 重写 User-Agent
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Opencode/1.18.31")
 	
-	// 2. 注入 Client-Hints (Chromium 物理环境指纹)
+	// 2. 注入 Client-Hints
 	req.Header.Set("sec-ch-ua", `"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"`)
 	req.Header.Set("sec-ch-ua-mobile", "?0")
 	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
 	
-	// 3. 注入 Fetch Metadata (跨域与来源伪装)
+	// 3. 注入 Fetch Metadata
 	req.Header.Set("sec-fetch-dest", "empty")
 	req.Header.Set("sec-fetch-mode", "cors")
 	req.Header.Set("sec-fetch-site", "cross-site")
@@ -57,18 +86,11 @@ func applyClientFingerprint(req *http.Request) {
 	req.Header.Set("Origin", "https://opencode.ai")
 	req.Header.Set("Referer", "https://opencode.ai/")
 	
-	// 6. 动态伪造独立 Session ID 与 Request ID，彻底隔离每笔请求的指纹追踪（适配 2026-09-06 强制校验）
-	rawUUID := strings.ReplaceAll(generateRandomUUID(), "-", "")
-	if len(rawUUID) > 24 {
-		rawUUID = rawUUID[:24]
-	}
-	sessionID := "ses_" + rawUUID
-	reqID := generateRandomUUID()
+	// 6. 注入合规的动态 Session ID 与 Request ID
+	sessionID := generateOpenCodeID("ses")
+	reqID := generateOpenCodeID("req")
 	req.Header.Set("x-opencode-session", sessionID)
-	req.Header.Set("x-opencode-session-id", sessionID)
-	req.Header.Set("x-session-id", sessionID)
 	req.Header.Set("x-request-id", reqID)
-	req.Header.Set("x-correlation-id", reqID)
 }
 
 //go:embed public/*
@@ -88,14 +110,12 @@ type Worker struct {
 func (w *Worker) markDirtyAndRestart() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// 如果已经在 30 秒内触发过重启，则忽略，防止密集重启
 	if w.IsDown && time.Since(w.LastFail) < 30*time.Second {
 		return
 	}
 	w.IsDown = true
 	w.LastFail = time.Now()
 
-	// 如果是直连远程域名（如 opencode.ai），不要触发本地重启脚本
 	if w.URL.Hostname() == "opencode.ai" || w.URL.Scheme == "https" {
 		go func() {
 			log.Printf("[直连模式] 远程 Worker %s 响应异常/429，标记临时冷却 5 秒...", w.URL.String())
@@ -109,7 +129,6 @@ func (w *Worker) markDirtyAndRestart() {
 
 	go func() {
 		log.Printf("[后台自愈] Worker %s 遇到 429 限制，触发重启刷新 Device Token...", w.URL.String())
-		// 调用外部重启脚本（需在容器或系统中提前放置 restart_worker.sh）
 		port := w.URL.Port()
 		if port == "" {
 			port = "80"
@@ -121,7 +140,6 @@ func (w *Worker) markDirtyAndRestart() {
 			log.Printf("[后台自愈] Worker %s 重启脚本执行异常: %v", w.URL.String(), err)
 		}
 		
-		// 预留足够的时间等待 Worker 完全启动
 		time.Sleep(15 * time.Second)
 		
 		w.mu.Lock()
@@ -148,7 +166,6 @@ func (t *RetryTransport) getNextWorker() *Worker {
 			return w
 		}
 	}
-	// 如果全部 Worker 都在自愈中，强行分配一个
 	return t.Workers[0]
 }
 
@@ -166,17 +183,15 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	for i := 0; i < maxRetries; i++ {
 		w := t.getNextWorker()
 
-		// 克隆 Request，避免修改原有 Request 影响其他逻辑
 		clonedReq := req.Clone(req.Context())
 		clonedReq.URL.Scheme = w.URL.Scheme
 		clonedReq.URL.Host = w.URL.Host
 
-		// 动态路径修正：官方的真实路径包含 /zen，无论直连还是发给本地代理节点，都必须加上 /zen 否则上游报 404
+		// 动态路径修正：官方上游真实路径为 /zen/v1/...
 		if strings.HasPrefix(clonedReq.URL.Path, "/v1/") {
 			clonedReq.URL.Path = "/zen" + clonedReq.URL.Path
 		}
 
-		// 鉴权修正：如果直连官方源站，需补充 public 密钥；如果请求本地 opencodefree 节点，则原样透传
 		if strings.Contains(w.URL.Host, "opencode.ai") {
 			clonedReq.Header.Set("Authorization", "Bearer public")
 		}
@@ -187,7 +202,6 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err := t.Transport.RoundTrip(clonedReq)
 		if err != nil {
-			// 如果是客户端主动取消请求（如用户停止生成），直接透传错误，切勿误判为 Worker 损坏！
 			if errors.Is(err, context.Canceled) || errors.Is(req.Context().Err(), context.Canceled) {
 				return nil, err
 			}
@@ -205,7 +219,6 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				resp.Body.Close()
 				continue
 			}
-			// 如果已经是最后一个 Worker（或单 Worker 模式），把真实的 429 响应透传给客户端
 			return resp, nil
 		}
 
@@ -223,15 +236,15 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // ----------------------------------------------------
 
-// 动态生成 Replacer，根据请求的模型区分要替换的名称
 func getReplacer(requestedModel string) *strings.Replacer {
 	if requestedModel == "" {
 		requestedModel = "deepseek-v4-flash"
 	}
 	return strings.NewReplacer(
+		"mimo-v2.5-free", requestedModel,
+		"ling-3.0-flash-fin-free", requestedModel,
 		"hy3-free", requestedModel,
 		"deepseek-v4-flash-free", requestedModel,
-		"mimo-v2.5-free", requestedModel,
 		"系统指令", "身份设定",
 		"系统提示词", "角色设定",
 		"系统提示", "背景设定",
@@ -248,36 +261,9 @@ func getInjectionPrompt(model string) string {
 	return ""
 }
 
-// 自动调用 RTK 压缩长文本，带有 1 秒超时保护
-func compressWithRTK(input string) string {
-	if len(input) < 3000 {
-		return input
-	}
-	
-	tmpFile, err := os.CreateTemp("", "rtk_input_*.txt")
-	if err == nil {
-		tmpFile.WriteString(input)
-		tmpFile.Close()
-		
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "rtk", "read", tmpFile.Name())
-		out, err := cmd.Output()
-		os.Remove(tmpFile.Name())
-		if err == nil && len(out) > 0 {
-			return string(out)
-		}
-	}
-	
-	if len(input) > 8000 {
-		return input[:4000] + "\n...[Context compressed by OpenCode Proxy RTK engine]...\n" + input[len(input)-4000:]
-	}
-	return input
-}
-
 var (
-	logMutex     sync.Mutex
-	callLogs     []string
+	logMutex sync.Mutex
+	callLogs []string
 )
 
 func addLog(msg string) {
@@ -289,7 +275,7 @@ func addLog(msg string) {
 	}
 }
 
-// 实时流式替换 Reader：实现真正的无延迟 SSE 字节流转发与替换
+// 实时流式替换 Reader
 type replacingReadCloser struct {
 	src      io.ReadCloser
 	buf      []byte
@@ -332,24 +318,19 @@ func (r *replacingReadCloser) Close() error {
 }
 
 func main() {
-	// rand.Seed(time.Now().UnixNano()) // Go 1.20+ 自动初始化随机数种子
-
 	subFS, err := fs.Sub(publicFiles, "public")
 	if err != nil {
 		log.Fatalf("无法加载内嵌的静态文件系统: %v", err)
 	}
 	fsHandler := http.FileServer(http.FS(subFS))
 
-	// 初始化 Workers 列表
 	workerStrs := os.Getenv("WORKERS")
 	var workers []*Worker
 	if workerStrs == "" {
-		// 默认行为：直连官方 OpenCode.ai 高可用源站
 		workerStrs = "https://opencode.ai"
 		log.Printf("未检测到 WORKERS 环境变量，采用单点直连模式: https://opencode.ai")
 	}
 
-	// 比如：WORKERS="http://127.0.0.1:8001,http://127.0.0.1:8002"
 	urls := strings.Split(workerStrs, ",")
 	for _, uStr := range urls {
 		uStr = strings.TrimSpace(uStr)
@@ -362,9 +343,7 @@ func main() {
 	}
 	log.Printf("启用了双活/多活 Worker 模式，共有 %d 个节点待命", len(workers))
 
-	// 我们依然用 SingleHostReverseProxy，但底层替换为自定义的 RetryTransport 来实现动态切换目标
-	proxy := httputil.NewSingleHostReverseProxy(workers[0].URL) // 这里的 URL 仅作初始化，实际会由 RetryTransport 覆写
-	
+	proxy := httputil.NewSingleHostReverseProxy(workers[0].URL)
 	proxy.Transport = &RetryTransport{
 		Transport: http.DefaultTransport,
 		Workers:   workers,
@@ -409,15 +388,12 @@ func main() {
 							}
 						}
 
-
 						modelLower := strings.ToLower(model)
-						if modelLower == "hy3" {
-							reqData["model"] = "hy3-free"
+						if strings.HasPrefix(modelLower, "ling") {
+							reqData["model"] = "ling-3.0-flash-fin-free"
 							modified = true
-						} else if strings.HasPrefix(modelLower, "deepseek") {
-							reqData["model"] = "deepseek-v4-flash-free"
-							modified = true
-						} else if strings.HasPrefix(modelLower, "mimo") {
+						} else {
+							// 默认统一智能路由到当前最稳定高速的 mimo-v2.5-free
 							reqData["model"] = "mimo-v2.5-free"
 							modified = true
 						}
@@ -440,11 +416,9 @@ func main() {
 			}
 		}
 
-		// Host 设置：为了让外部 opencodefree 能够正确识别或向后兼容直连
 		req.Host = "opencode.ai"
 		req.Header.Set("Authorization", "Bearer public")
 		
-		// 全维度应用物理客户端指纹与动态 Session/Request UUID 伪装
 		applyClientFingerprint(req)
 		
 		if requestedModel != "unknown" {
@@ -452,23 +426,19 @@ func main() {
 			req.Header.Set("X-Requested-Model", requestedModel)
 		}
 		
-		// 强制要求上游返回明文数据，防止 Gzip 干扰替换
 		req.Header.Del("Accept-Encoding")
 	}
 
-	// 响应拦截：把 free 模型名换回请求的模型名，让下游统计工具看到的永远是请求的模型名
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		reqModel := resp.Request.Header.Get("X-Requested-Model")
 		replacer := getReplacer(reqModel)
 		
 		contentType := resp.Header.Get("Content-Type")
 		if strings.Contains(contentType, "text/event-stream") {
-			// 流式响应 (SSE)：使用流式替换器
 			resp.Body = &replacingReadCloser{src: resp.Body, replacer: replacer}
 			resp.Header.Del("Content-Length")
 			resp.ContentLength = -1
 		} else {
-			// 非流式响应 (JSON)：一次性全量读取并替换，重新设置 100% 精确的 Content-Length
 			if resp.Body != nil {
 				bodyBytes, err := io.ReadAll(resp.Body)
 				resp.Body.Close()
@@ -516,6 +486,7 @@ func main() {
 				{"id": "deepseek-r1", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "mimo-v2.5-pro", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "mimo-v2.5", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "ling-3.0", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -545,7 +516,6 @@ func main() {
 			w.Write([]byte("暂无调用记录。\n"))
 			return
 		}
-		// 倒序输出，最近的日志在前面
 		var buf bytes.Buffer
 		buf.WriteString("=====================================\n")
 		buf.WriteString("       OpenCodeFree 代理网关路由日志     \n")
@@ -560,7 +530,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "3000" // 避让给 Nginx/Argo 使用 8080
+		port = "8080"
 	}
 	ip := os.Getenv("IP")
 	if ip == "" {
@@ -568,7 +538,7 @@ func main() {
 	}
 	bindAddr := net.JoinHostPort(ip, port)
 
-	log.Printf("双渠道负载均衡网关已启动，监听地址 %s...", bindAddr)
+	log.Printf("OpenCode 代理网关已启动，监听地址 %s...", bindAddr)
 	if err := http.ListenAndServe(bindAddr, mux); err != nil {
 		log.Fatalf("网关启动失败: %v", err)
 	}
