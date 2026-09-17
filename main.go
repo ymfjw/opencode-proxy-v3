@@ -35,7 +35,7 @@ func generateRandomUUID() string {
 // 模拟最新 Chrome Desktop / VSCode Electron 物理客户端全维度指纹 Header
 func applyClientFingerprint(req *http.Request) {
 	// 1. 重写 User-Agent，覆写默认的 Go-http-client 特征
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Opencode/1.0.8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Opencode/1.18.31")
 	
 	// 2. 注入 Client-Hints (Chromium 物理环境指纹)
 	req.Header.Set("sec-ch-ua", `"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"`)
@@ -53,7 +53,7 @@ func applyClientFingerprint(req *http.Request) {
 	
 	// 5. OpenCode 客户端固定关联标头
 	req.Header.Set("x-opencode-client", "desktop")
-	req.Header.Set("x-opencode-version", "1.0.8")
+	req.Header.Set("x-opencode-version", "1.18.31")
 	req.Header.Set("Origin", "https://opencode.ai")
 	req.Header.Set("Referer", "https://opencode.ai/")
 	
