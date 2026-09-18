@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -13,7 +14,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -31,7 +31,6 @@ var (
 	idCounter     int64
 )
 
-// 严格还原 OpenCode 官方单调 ID 生成算法 (Prefix + 6字节时间戳 + 14位Base62随机串)
 func generateOpenCodeID(prefix string) string {
 	idGenMu.Lock()
 	defer idGenMu.Unlock()
@@ -43,8 +42,12 @@ func generateOpenCodeID(prefix string) string {
 	}
 	idCounter++
 
-	// descending 模式按位取反（与官方 TypeScript 实现 100% 一致）
-	now := ^(nowMs*0x1000 + idCounter)
+	var now int64
+	if prefix == "ses" {
+		now = ^(nowMs*0x1000 + idCounter)
+	} else {
+		now = nowMs*0x1000 + idCounter
+	}
 
 	var timeBytes [6]byte
 	for i := 0; i < 6; i++ {
@@ -61,44 +64,80 @@ func generateOpenCodeID(prefix string) string {
 	return fmt.Sprintf("%s_%x%s", prefix, timeBytes, string(randomPart))
 }
 
-// 模拟最新 Chrome Desktop / VSCode Electron 物理客户端全维度指纹 Header
+var fingerprintTools = []map[string]interface{}{
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "bash",
+			"description": "OpenCode built-in bash tool",
+			"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "glob",
+			"description": "OpenCode built-in glob tool",
+			"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "grep",
+			"description": "OpenCode built-in grep tool",
+			"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        "read",
+			"description": "OpenCode built-in read tool",
+			"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		},
+	},
+}
+
+func ensureTools(reqData map[string]interface{}) {
+	present := make(map[string]bool)
+	var existingTools []interface{}
+	if tools, ok := reqData["tools"].([]interface{}); ok {
+		existingTools = tools
+		for _, t := range tools {
+			if tm, ok := t.(map[string]interface{}); ok {
+				if fn, ok := tm["function"].(map[string]interface{}); ok {
+					if name, ok := fn["name"].(string); ok {
+						present[name] = true
+					}
+				}
+				if name, ok := tm["name"].(string); ok {
+					present[name] = true
+				}
+			}
+		}
+	}
+	for _, ft := range fingerprintTools {
+		fnName := ft["function"].(map[string]interface{})["name"].(string)
+		if !present[fnName] {
+			existingTools = append(existingTools, ft)
+			present[fnName] = true
+		}
+	}
+	reqData["tools"] = existingTools
+}
+
 func applyClientFingerprint(req *http.Request) {
-	// 1. 重写 User-Agent
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Opencode/1.18.31")
-	
-	// 2. 注入 Client-Hints
-	req.Header.Set("sec-ch-ua", `"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"`)
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-	
-	// 3. 注入 Fetch Metadata
-	req.Header.Set("sec-fetch-dest", "empty")
-	req.Header.Set("sec-fetch-mode", "cors")
-	req.Header.Set("sec-fetch-site", "cross-site")
-	
-	// 4. 标准 HTTP 语言与 Accept 标头
-	req.Header.Set("Accept", "application/json, text/event-stream, */*")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
-	
-	// 5. OpenCode 客户端固定关联标头
+	req.Header.Set("User-Agent", "opencode/1.18.31")
 	req.Header.Set("x-opencode-client", "desktop")
-	req.Header.Set("x-opencode-version", "1.18.31")
-	req.Header.Set("Origin", "https://opencode.ai")
-	req.Header.Set("Referer", "https://opencode.ai/")
-	
-	// 6. 注入合规的动态 Session ID 与 Request ID
-	sessionID := generateOpenCodeID("ses")
-	reqID := generateOpenCodeID("req")
-	req.Header.Set("x-opencode-session", sessionID)
-	req.Header.Set("x-request-id", reqID)
+	req.Header.Set("x-opencode-project", "global")
+	req.Header.Set("x-opencode-session", generateOpenCodeID("ses"))
+	req.Header.Set("x-opencode-request", generateOpenCodeID("msg"))
+	req.Header.Set("Accept", "text/event-stream")
 }
 
 //go:embed public/*
 var publicFiles embed.FS
-
-// ----------------------------------------------------
-// 双活 Worker 与 429 故障自愈重试逻辑
-// ----------------------------------------------------
 
 type Worker struct {
 	URL      *url.URL
@@ -187,7 +226,6 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		clonedReq.URL.Scheme = w.URL.Scheme
 		clonedReq.URL.Host = w.URL.Host
 
-		// 动态路径修正：官方上游真实路径为 /zen/v1/...
 		if strings.HasPrefix(clonedReq.URL.Path, "/v1/") {
 			clonedReq.URL.Path = "/zen" + clonedReq.URL.Path
 		}
@@ -234,8 +272,6 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("all workers failed or returned 429")
 }
 
-// ----------------------------------------------------
-
 func getReplacer(requestedModel string) *strings.Replacer {
 	if requestedModel == "" {
 		requestedModel = "deepseek-v4-flash"
@@ -275,7 +311,6 @@ func addLog(msg string) {
 	}
 }
 
-// 实时流式替换 Reader
 type replacingReadCloser struct {
 	src      io.ReadCloser
 	buf      []byte
@@ -343,115 +378,9 @@ func main() {
 	}
 	log.Printf("启用了双活/多活 Worker 模式，共有 %d 个节点待命", len(workers))
 
-	proxy := httputil.NewSingleHostReverseProxy(workers[0].URL)
-	proxy.Transport = &RetryTransport{
+	retryTransport := &RetryTransport{
 		Transport: http.DefaultTransport,
 		Workers:   workers,
-	}
-	
-	originalDirector := proxy.Director
-
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		
-		requestedModel := "unknown"
-		
-		if req.Method == "POST" && req.Body != nil {
-			bodyBytes, err := io.ReadAll(req.Body)
-			if err == nil {
-				var reqData map[string]interface{}
-				if err := json.Unmarshal(bodyBytes, &reqData); err == nil {
-					if model, ok := reqData["model"].(string); ok {
-						requestedModel = model
-						modified := false
-						
-						injectPrompt := getInjectionPrompt(model)
-						if injectPrompt != "" {
-							if messages, ok := reqData["messages"].([]interface{}); ok && len(messages) > 0 {
-								hasSystem := false
-								if firstMsg, ok := messages[0].(map[string]interface{}); ok {
-									role, _ := firstMsg["role"].(string)
-									if role == "system" {
-										hasSystem = true
-										content, _ := firstMsg["content"].(string)
-										firstMsg["content"] = injectPrompt + "\n" + content
-									}
-								}
-								if !hasSystem {
-									newSystemMsg := map[string]interface{}{
-										"role":    "system",
-										"content": injectPrompt,
-									}
-									reqData["messages"] = append([]interface{}{newSystemMsg}, messages...)
-								}
-								modified = true
-							}
-						}
-
-						modelLower := strings.ToLower(model)
-						if strings.HasPrefix(modelLower, "ling") {
-							reqData["model"] = "ling-3.0-flash-fin-free"
-							modified = true
-						} else {
-							// 默认统一智能路由到当前最稳定高速的 mimo-v2.5-free
-							reqData["model"] = "mimo-v2.5-free"
-							modified = true
-						}
-						
-						if modified {
-							newBodyBytes, _ := json.Marshal(reqData)
-							req.Body = io.NopCloser(bytes.NewBuffer(newBodyBytes))
-							req.ContentLength = int64(len(newBodyBytes))
-							req.Header.Set("Content-Length", fmt.Sprint(len(newBodyBytes)))
-						} else {
-							req.Header.Set("Content-Length", fmt.Sprint(len(bodyBytes)))
-							req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-						}
-					} else {
-						req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-					}
-				} else {
-					req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-				}
-			}
-		}
-
-		req.Host = "opencode.ai"
-		req.Header.Set("Authorization", "Bearer public")
-		
-		applyClientFingerprint(req)
-		
-		if requestedModel != "unknown" {
-			addLog(fmt.Sprintf("[%s] 请求 %s -> ☁️ 分配至 OpenCode 渠道", time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"), requestedModel))
-			req.Header.Set("X-Requested-Model", requestedModel)
-		}
-		
-		req.Header.Del("Accept-Encoding")
-	}
-
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		reqModel := resp.Request.Header.Get("X-Requested-Model")
-		replacer := getReplacer(reqModel)
-		
-		contentType := resp.Header.Get("Content-Type")
-		if strings.Contains(contentType, "text/event-stream") {
-			resp.Body = &replacingReadCloser{src: resp.Body, replacer: replacer}
-			resp.Header.Del("Content-Length")
-			resp.ContentLength = -1
-		} else {
-			if resp.Body != nil {
-				bodyBytes, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if err == nil {
-					replaced := replacer.Replace(string(bodyBytes))
-					newBytes := []byte(replaced)
-					resp.Body = io.NopCloser(bytes.NewReader(newBytes))
-					resp.ContentLength = int64(len(newBytes))
-					resp.Header.Set("Content-Length", fmt.Sprint(len(newBytes)))
-				}
-			}
-		}
-		return nil
 	}
 
 	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
@@ -487,17 +416,221 @@ func main() {
 				{"id": "mimo-v2.5-pro", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "mimo-v2.5", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "ling-3.0", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "nemotron-3-ultra", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "nemotron-3.5-lightning", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resData)
 	}
 
+	chatHandler := func(w http.ResponseWriter, r *http.Request) {
+		requestedModel := "mimo-v2.5"
+		clientWantsStream := false
+
+		var bodyBytes []byte
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+			r.Body.Close()
+		}
+
+		if len(bodyBytes) > 0 {
+			var reqData map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &reqData); err == nil {
+				if s, ok := reqData["stream"].(bool); ok {
+					clientWantsStream = s
+				}
+				if model, ok := reqData["model"].(string); ok {
+					requestedModel = model
+					m := strings.ToLower(model)
+
+					injectPrompt := getInjectionPrompt(model)
+					if injectPrompt != "" {
+						if messages, ok := reqData["messages"].([]interface{}); ok && len(messages) > 0 {
+							hasSystem := false
+							if firstMsg, ok := messages[0].(map[string]interface{}); ok {
+								role, _ := firstMsg["role"].(string)
+								if role == "system" {
+									hasSystem = true
+									content, _ := firstMsg["content"].(string)
+									firstMsg["content"] = injectPrompt + "\n" + content
+								}
+							}
+							if !hasSystem {
+								newSystemMsg := map[string]interface{}{
+									"role":    "system",
+									"content": injectPrompt,
+								}
+								reqData["messages"] = append([]interface{}{newSystemMsg}, messages...)
+							}
+						}
+					}
+
+					if strings.HasPrefix(m, "ling") {
+						reqData["model"] = "ling-3.0-flash-fin-free"
+					} else if strings.Contains(m, "nemotron-3.5") || strings.Contains(m, "lightning") {
+						reqData["model"] = "nemotron-3.5-lightning-free"
+					} else if strings.Contains(m, "nemotron") {
+						reqData["model"] = "nemotron-3-ultra-free"
+					} else {
+						reqData["model"] = "mimo-v2.5-free"
+					}
+				}
+
+				ensureTools(reqData)
+				reqData["stream"] = true
+
+				bodyBytes, _ = json.Marshal(reqData)
+			}
+		}
+
+		targetPath := r.URL.Path
+		if strings.HasPrefix(targetPath, "/v1/") {
+			targetPath = "/zen" + targetPath
+		} else if !strings.HasPrefix(targetPath, "/zen/") {
+			targetPath = "/zen/v1/chat/completions"
+		}
+
+		targetURL := "https://opencode.ai" + targetPath
+		if r.URL.RawQuery != "" {
+			targetURL += "?" + r.URL.RawQuery
+		}
+
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		outReq.Header.Set("Content-Type", "application/json")
+		applyClientFingerprint(outReq)
+
+		addLog(fmt.Sprintf("[%s] 请求 %s -> ☁️ 分配至 OpenCode 渠道", time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"), requestedModel))
+
+		resp, err := retryTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, "Gateway request error: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			return
+		}
+
+		replacer := getReplacer(requestedModel)
+
+		if clientWantsStream {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Del("Content-Length")
+			w.WriteHeader(http.StatusOK)
+
+			flusher, _ := w.(http.Flusher)
+			reader := &replacingReadCloser{src: resp.Body, replacer: replacer}
+			buf := make([]byte, 4096)
+			for {
+				n, rErr := reader.Read(buf)
+				if n > 0 {
+					w.Write(buf[:n])
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+				if rErr != nil {
+					break
+				}
+			}
+			return
+		}
+
+		// 非流式聚合
+		scanner := bufio.NewScanner(resp.Body)
+		var fullContent, reasoningContent, respId, respModel string
+
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if strings.HasPrefix(line, "data: ") {
+				dataStr := strings.TrimSpace(line[6:])
+				if dataStr == "[DONE]" {
+					continue
+				}
+				var chunk map[string]interface{}
+				if err := json.Unmarshal([]byte(dataStr), &chunk); err == nil {
+					if respId == "" {
+						if id, ok := chunk["id"].(string); ok {
+							respId = id
+						}
+					}
+					if model, ok := chunk["model"].(string); ok {
+						respModel = model
+					}
+					if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+						if choice, ok := choices[0].(map[string]interface{}); ok {
+							if delta, ok := choice["delta"].(map[string]interface{}); ok {
+								if c, ok := delta["content"].(string); ok {
+									fullContent += c
+								}
+								if rc, ok := delta["reasoning_content"].(string); ok {
+									reasoningContent += rc
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if respId == "" {
+			respId = fmt.Sprintf("chatcmpl-%d", time.Now().UnixMilli())
+		}
+		if respModel == "" {
+			respModel = requestedModel
+		}
+
+		finalJson := map[string]interface{}{
+			"id":      respId,
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   requestedModel,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": replacer.Replace(fullContent),
+					},
+					"finish_reason": "stop",
+				},
+			},
+			"usage": map[string]interface{}{
+				"prompt_tokens":     20,
+				"completion_tokens": len(fullContent),
+				"total_tokens":      20 + len(fullContent),
+			},
+		}
+
+		if reasoningContent != "" {
+			choices := finalJson["choices"].([]map[string]interface{})
+			msg := choices[0]["message"].(map[string]interface{})
+			msg["reasoning_content"] = replacer.Replace(reasoningContent)
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(finalJson)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", corsMiddleware(modelsHandler))
-	mux.HandleFunc("/v1/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		proxy.ServeHTTP(w, r)
-	}))
+	mux.HandleFunc("/v1/", corsMiddleware(chatHandler))
 	mux.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		urlData, err := os.ReadFile("/tmp/tunnel.url")
