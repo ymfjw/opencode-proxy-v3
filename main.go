@@ -534,18 +534,28 @@ func main() {
 				}
 
 				if isMuse {
-					reqData["input"] = reqData["messages"]
-					delete(reqData, "messages")
-					reqData["tools"] = []map[string]interface{}{
-						{"type": "function", "name": "bash", "description": "bash", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
-						{"type": "function", "name": "glob", "description": "glob", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
-						{"type": "function", "name": "grep", "description": "grep", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
-						{"type": "function", "name": "read", "description": "read", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
+					musePayload := map[string]interface{}{
+						"model": "muse-spark-1.3-contributor-free",
+						"input": reqData["messages"],
+						"tools": []map[string]interface{}{
+							{"type": "function", "name": "bash", "description": "bash", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
+							{"type": "function", "name": "glob", "description": "glob", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
+							{"type": "function", "name": "grep", "description": "grep", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
+							{"type": "function", "name": "read", "description": "read", "parameters": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
+						},
+						"stream": true,
 					}
+					if temp, ok := reqData["temperature"]; ok {
+						musePayload["temperature"] = temp
+					}
+					if topP, ok := reqData["top_p"]; ok {
+						musePayload["top_p"] = topP
+					}
+					reqData = musePayload
 				} else {
 					ensureTools(reqData)
+					reqData["stream"] = true
 				}
-				reqData["stream"] = true
 
 				bodyBytes, _ = json.Marshal(reqData)
 			}
