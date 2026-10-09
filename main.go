@@ -520,7 +520,7 @@ func main() {
 					if strings.Contains(m, "muse") {
 						isMuse = true
 						reqData["model"] = "muse-spark-1.3-contributor-free"
-					} else if m == "mimo-v2.6-flash-free" || strings.Contains(m, "2.6") || strings.Contains(m, "v2.6") {
+					} else if strings.Contains(m, "mimo") || strings.Contains(m, "2.6") || strings.Contains(m, "2.5") {
 						reqData["model"] = "mimo-v2.6-flash-free"
 					} else if strings.HasPrefix(m, "ling") {
 						reqData["model"] = "ling-3.0-flash-fin-free"
@@ -529,7 +529,7 @@ func main() {
 					} else if strings.Contains(m, "nemotron") {
 						reqData["model"] = "nemotron-3-ultra-free"
 					} else {
-						reqData["model"] = "mimo-v2.5-free"
+						reqData["model"] = "mimo-v2.6-flash-free"
 					}
 				}
 
